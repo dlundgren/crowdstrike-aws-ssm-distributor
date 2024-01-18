@@ -57,16 +57,17 @@ EOF
 userAgent="crowdstrike-custom-api-distributor-package/v1.0.0"
 
 osDetail(){
-  UN=$(uname -s)
-  if [[ "$UN" == "Darwin" ]]
-  then
-	OS_NAME="Darwin"
-	OS_VERSION=$(uname -r)
-  else
-	OS_NAME=$(cat /etc/*release | grep NAME= | awk '!/CODENAME/ && !/PRETTY_NAME/' | awk '{ print $1 }' | awk -F'=' '{ print $2 }' | sed "s/\"//g")
-	OS_NAME=$(echo $OS_NAME | awk '{ print $1 }')
-	OS_VERSION=$(cat /etc/*release | grep VERSION_ID= | awk '{ print $1 }' | awk -F'=' '{ print $2 }' | sed "s/\"//g")
-  fi
+  case "$(uname -s)" in
+    Darwin)
+        OS_NAME="Darwin"
+	    OS_VERSION=$(uname -r)
+        ;;
+    *)
+    	OS_NAME=$(cat /etc/*release | grep NAME= | awk '!/CODENAME/ && !/PRETTY_NAME/' | awk '{ print $1 }' | awk -F'=' '{ print $2 }' | sed "s/\"//g")
+	    OS_NAME=$(echo $OS_NAME | awk '{ print $1 }')
+	    OS_VERSION=$(cat /etc/*release | grep VERSION_ID= | awk '{ print $1 }' | awk -F'=' '{ print $2 }' | sed "s/\"//g")
+	    ;;
+  esac
 }
 
 rpmInstall(){
@@ -78,9 +79,10 @@ rpmInstall(){
 }
 
 aptInstall(){
+   echo "file at $1"
    # May need to move this over to snap for Ubuntu 20
    apt-get -y install libnl-genl-3-200 libnl-3-200
-   sudo dpkg -i $1
+   sudo dpkg -i "$1"
    apt-get -y --fix-broken install
    /opt/CrowdStrike/falconctl -s -f --cid=$2 $3 $4
    service falcon-sensor restart
@@ -139,10 +141,11 @@ fi
 
 if ! [ -z "$SSM_HOST" ]
 then
-    if [[ "$SSM_HOST" == "https://"* ]] || [[ "$SSM_HOST" == "http://"* ]]
-    then
-        SSM_HOST=$(echo $SSM_HOST | sed 's/https\?:\/\///')
-    fi
+    case "$SSM_HOST" in
+        https://|http://)
+            SSM_HOST=$(echo $SSM_HOST | sed 's/https\?:\/\///')
+            ;;
+    esac
 fi
 
 if [ -z "$CS_FALCON_OAUTH_TOKEN" ] && [ -z "$CS_FALCON_CLIENT_ID" ] && [ -z "$CS_FALCON_CLIENT_SECRET" ]; then
@@ -174,12 +177,18 @@ then
 fi
 
 osDetail
-OUTPUT_DESTINATION="."
+OUTPUT_DESTINATION="/tmp"
 
 case "$OS_NAME" in
-    deb?*|Deb?*|ubu?*|Ubu?* )
+    deb?*|Deb?* )
         OS_NAME="Debian"
-	PACKAGER="apt"
+	    PACKAGER="apt"
+        ;;
+    ubu?*|Ubu?* )
+        OS_NAME="Ubuntu"
+	    PACKAGER="apt"
+	    # Strip the OS version to just the major
+	    OS_VERSION=$( echo "$OS_VERSION" | grep -oP "[0-9]+" | head -1)
         ;;
     rhel|RHEL|red?*|cent?*|Red?*|Cent?*|ora?*|Ora?* )
         OS_NAME="RHEL/CentOS/Oracle"
@@ -187,23 +196,25 @@ case "$OS_NAME" in
         ;;
     sles|SLES )
         OS_NAME="SLES"
-	PACKAGER="zypper"
+	    PACKAGER="zypper"
         ;;
     amz?*|Ama?*|ama?* )
         OS_NAME="Amazon Linux"
-	PACKAGER="yum"
+    	PACKAGER="yum"
         ;;
     win?*|Win?* )
         OS_NAME="Windows"
-	PACKAGER="exe"
+	    PACKAGER="exe"
         ;;
 esac
 
-OS_VERSION=2
-if [[ "$(uname -p)" != *86* ]]
-then
-    OS_VERSION="$OS_VERSION - arm64"
-fi
+WANTS_ARM=0
+case "$(uname -p)" in
+    *86*) ;;
+    *)
+        WANTS_ARM=1
+        ;;
+esac
 
 ## Get Installer Versions
 jsonResult=$(curl -s -L -G "https://$SSM_HOST/sensors/combined/installers/v1" \
@@ -211,11 +222,13 @@ jsonResult=$(curl -s -L -G "https://$SSM_HOST/sensors/combined/installers/v1" \
     -H "Authorization: Bearer $CS_FALCON_OAUTH_TOKEN" \
     -H "User-Agent: $userAgent")
 
-if [[ $jsonResult == *"denied"* ]]; then
-    echoRed "Invalid Access Token"
-    exit 1
-fi
-#echo $jsonResult
+case "$jsonResult" in
+    *denied*)
+        echoRed "Invalid Access Token"
+        exit 1
+        ;;
+esac
+
 sha_list=$(echo "$jsonResult" | jsonValue "sha256")
 if [ -z "$sha_list" ]; then
     echoRed "No sensor found for with OS Name: $OS_NAME"
@@ -225,17 +238,35 @@ fi
 INDEX=1
 if [ -n "$OS_VERSION" ]; then
     found=0
-    IFS=$'\n'
+    IFS='
+'
 	for l in $(echo "$jsonResult" | jsonValue "os_version"); do
         l=$(echo "$l" | sed 's/ *$//g' | sed 's/^ *//g')
-		if [ "$l" = "$OS_VERSION" ]; then
-            ((found+=1))
-            if [ "$found" == "$((NCNT+1))" ]
-            then
-	            break
-	    fi
-        fi
-		((INDEX+=1))
+        case "$l" in
+            *$OS_VERSION*)
+                case "$l" in
+                    *arm64)
+                        if [ "$WANTS_ARM" = "1" ]; then
+                            found=$((found+1))
+                            if [ "$found" = "$((NCNT+1))" ]; then
+                                break
+                            fi
+                        fi
+                        ;;
+                    *)
+                        found=$((found+1))
+                        if [ "$found" = "$((NCNT+1))" ]; then
+                            break
+                        fi
+
+                        ;;
+                esac
+                ;;
+            *)
+                # nothing to do...
+                ;;
+        esac
+		INDEX=$((INDEX+1))
     done
     if [ $found = 0 ]; then
         echoRed "Unable to locate matching sensor: $OS_NAME@$OS_VERSION"
@@ -252,7 +283,7 @@ if [ -z "$sha" ]; then
     exit 1
 fi
 
-filename="$OUTPUT_DESTINATION/$name.$file_type"
+filename="$OUTPUT_DESTINATION/$name"
 #clean up our calculated sha
 sha=$(echo $sha | xargs)
 curl -s -L "https://$SSM_HOST/sensors/entities/download-installer/v1?id=$sha" \
@@ -262,11 +293,11 @@ curl -s -L "https://$SSM_HOST/sensors/entities/download-installer/v1?id=$sha" \
 
 echo "Sensor binary output to: $filename"
 
-if [[ "$PACKAGER" == "yum" || "$PACKAGER" == "zypper" ]]
-then
-	rpmInstall $filename $CS_FALCON_CID $CS_INSTALL_PARAMS $CS_INSTALL_TOKEN
-fi
-if [[ "$PACKAGER" == "apt" ]]
-then
-	aptInstall $filename $CS_FALCON_CID $CS_INSTALL_PARAMS $CS_INSTALL_TOKEN
-fi
+case "$PACKAGER" in
+    yum|zypper)
+        rpmInstall "$filename" $CS_FALCON_CID $CS_INSTALL_PARAMS $CS_INSTALL_TOKEN
+        ;;
+    apt)
+	    aptInstall "$filename" $CS_FALCON_CID $CS_INSTALL_PARAMS $CS_INSTALL_TOKEN
+	    ;;
+esac
